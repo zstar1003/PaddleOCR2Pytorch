@@ -147,3 +147,6 @@ det_models*
 rec_models*
 *副本*
 *测试数据*
+
+PP-OCRv5_server_rec_pretrained.pdparams
+PP-OCRv5_server_rec_infer/

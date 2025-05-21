@@ -1,812 +1,575 @@
+from __future__ import absolute_import, division, print_function
+
 import math
 import torch
-import copy
-from torch import nn
+from torch import nn, Tensor  # 确保 Tensor 被导入
 import torch.nn.functional as F
-from torch.nn import ModuleList as LayerList
-from torch.nn.init import xavier_uniform_
-from torch.nn import Dropout, LayerNorm, Conv2d
-import numpy as np
-from pytorchocr.modeling.heads.multiheadAttention import MultiheadAttention
-from torch.nn.init import xavier_normal_
+from typing import Dict, Any, List, Optional, Tuple  # 增加了 Tuple
+
+# 从 ppocr.modeling.backbones.rec_svtrnet import Mlp, zeros_
+# 我们需要 Mlp 的 PyTorch 版本，这里直接定义
+# zeros_ 和 xavier_normal_ 也是辅助函数
 
 
-class Transformer(nn.Module):
-    """A transformer model. User is able to modify the attributes as needed. The architechture
-    is based on the paper "Attention Is All You Need". Ashish Vaswani, Noam Shazeer,
-    Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and
-    Illia Polosukhin. 2017. Attention is all you need. In Advances in Neural Information
-    Processing Systems, pages 6000-6010.
+# --- 辅助初始化函数 和 Mlp ---
+def trunc_normal_(
+    tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0
+) -> Tensor:
+    """截断正态初始化，用于权重。"""
 
-    Args:
-        d_model: the number of expected features in the encoder/decoder inputs (default=512).
-        nhead: the number of heads in the multiheadattention models (default=8).
-        num_encoder_layers: the number of sub-encoder-layers in the encoder (default=6).
-        num_decoder_layers: the number of sub-decoder-layers in the decoder (default=6).
-        dim_feedforward: the dimension of the feedforward network model (default=2048).
-        dropout: the dropout value (default=0.1).
-        custom_encoder: custom encoder (default=None).
-        custom_decoder: custom decoder (default=None).
+    def norm_cdf(x):
+        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
+    if (mean < a - 2 * std) or (mean > b + 2 * std):
+        print("警告: trunc_normal_ 均值与 [a,b] 区间距离 > 2 std")
+    with torch.no_grad():
+        l = norm_cdf((a - mean) / std)
+        u = norm_cdf((b - mean) / std)
+        tensor.uniform_(2 * l - 1, 2 * u - 1)
+        tensor.erfinv_()
+        tensor.mul_(std * math.sqrt(2.0))
+        tensor.add_(mean)
+        tensor.clamp_(min=a, max=b)
+        return tensor
+
+
+def zeros_(tensor: Tensor) -> Tensor:
+    """用零填充张量。"""
+    with torch.no_grad():
+        tensor.zero_()
+        return tensor
+
+
+def xavier_normal_(tensor: Tensor, gain: float = 1.0) -> Tensor:
+    """Xavier Normal 初始化。"""
+    with torch.no_grad():
+        return nn.init.xavier_normal_(tensor, gain=gain)
+
+
+class Mlp(nn.Module):
+    """多层感知机 (MLP)，用于 TransformerBlock。
+    与 ppocr.modeling.backbones.rec_svtrnet.Mlp 对应。
     """
 
-    def __init__(self,
-                 d_model=512,
-                 nhead=8,
-                 num_encoder_layers=6,
-                 beam_size=0,
-                 num_decoder_layers=6,
-                 max_len=25,
-                 dim_feedforward=1024,
-                 attention_dropout_rate=0.0,
-                 residual_dropout_rate=0.1,
-                 custom_encoder=None,
-                 custom_decoder=None,
-                 in_channels=0,
-                 out_channels=0,
-                 scale_embedding=True):
-        super(Transformer, self).__init__()
-        self.out_channels = out_channels # out_channels + 1
-        self.max_len = max_len
-        self.embedding = Embeddings(
-            d_model=d_model,
-            vocab=self.out_channels,
-            padding_idx=0,
-            scale_embedding=scale_embedding)
-        self.positional_encoding = PositionalEncoding(
-            dropout=residual_dropout_rate,
-            dim=d_model, )
-        if custom_encoder is not None:
-            self.encoder = custom_encoder
-        else:
-            if num_encoder_layers > 0:
-                encoder_layer = TransformerEncoderLayer(
-                    d_model, nhead, dim_feedforward, attention_dropout_rate,
-                    residual_dropout_rate)
-                self.encoder = TransformerEncoder(encoder_layer,
-                                                  num_encoder_layers)
-            else:
-                self.encoder = None
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        # Paddle TransformerBlock 中的 Mlp 使用 nn.ReLU
+        self.act = nn.ReLU() if act_layer == nn.ReLU else act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
 
-        if custom_decoder is not None:
-            self.decoder = custom_decoder
-        else:
-            decoder_layer = TransformerDecoderLayer(
-                d_model, nhead, dim_feedforward, attention_dropout_rate,
-                residual_dropout_rate)
-            self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers)
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)  # Paddle Mlp 在 act 后有 drop
+        x = self.fc2(x)
+        x = self.drop(x)  # Paddle Mlp 在 fc2 后有 drop
+        return x
 
-        self._reset_parameters()
-        self.beam_size = beam_size
+
+# --- NRTR Head 的 PyTorch 实现 ---
+
+
+class Embeddings(nn.Module):  # 重命名以匹配 Paddle 中的类名
+    """NRTR 词嵌入层。对应 Paddle 的 Embeddings 类。"""
+
+    def __init__(
+        self,
+        d_model: int,
+        vocab: int,
+        padding_idx: Optional[int] = None,
+        scale_embedding: bool = True,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab, d_model, padding_idx=padding_idx)
+        # Paddle 初始化: w0 = np.random.normal(0.0, d_model**-0.5, (vocab, d_model))
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=d_model**-0.5)
+        if padding_idx is not None:  # 确保 padding_idx 的权重为 0
+            with torch.no_grad():
+                self.embedding.weight[padding_idx].fill_(0)
         self.d_model = d_model
-        self.nhead = nhead
-        self.tgt_word_prj = nn.Linear(
-            d_model, self.out_channels, bias=False)
-        w0 = np.random.normal(0.0, d_model ** -0.5,
-                              (self.out_channels, d_model)).astype(np.float32)
-        self.tgt_word_prj.weight.data = torch.from_numpy(w0)
-        self.apply(self._init_weights)
+        self.scale_embedding = scale_embedding
+        self.scale_factor = math.sqrt(d_model) if scale_embedding else 1.0
 
-    def _init_weights(self, m):
-
-        if isinstance(m, nn.Conv2d):
-            xavier_normal_(m.weight)
-            if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
-
-    def forward_train(self, src, tgt):
-        tgt = tgt[:, :-1]
-
-        tgt_key_padding_mask = self.generate_padding_mask(tgt)
-        tgt = self.embedding(tgt).permute(1, 0, 2)
-        tgt = self.positional_encoding(tgt)
-        tgt_mask = self.generate_square_subsequent_mask(tgt.shape[0], tgt.device)
-
-        if self.encoder is not None:
-            src = self.positional_encoding(src.permute(1, 0, 2))
-            memory = self.encoder(src)
-        else:
-            memory = src.squeeze(2).permute(2, 0, 1)
-        output = self.decoder(
-            tgt,
-            memory,
-            tgt_mask=tgt_mask,
-            memory_mask=None,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=None)
-        output = output.permute(1, 0, 2)
-        logit = self.tgt_word_prj(output)
-        return logit
-
-    def forward(self, src, targets=None):
-        """Take in and process masked source/target sequences.
-        Args:
-            src: the sequence to the encoder (required).
-            tgt: the sequence to the decoder (required).
-        Shape:
-            - src: :math:`(S, N, E)`.
-            - tgt: :math:`(T, N, E)`.
-        Examples:
-            >>> output = transformer_model(src, tgt)
-        """
-
-        if self.training:
-            max_len = targets[1].max()
-            tgt = targets[0][:, :2 + max_len]
-            return self.forward_train(src, tgt)
-        else:
-            if self.beam_size > 0:
-                return self.forward_beam(src)
-            else:
-                return self.forward_test(src)
-
-    def forward_test(self, src):
-        bs = src.shape[0]
-        if self.encoder is not None:
-            src = self.positional_encoding(src.permute(1, 0, 2))
-            memory = self.encoder(src)
-        else:
-            memory = torch.squeeze(src, 2).permute(2, 0, 1)
-        dec_seq = torch.full((bs, 1), 2, dtype=torch.int64)
-        dec_prob = torch.full((bs, 1), 1., dtype=torch.float32)
-        for len_dec_seq in range(1, 25):
-            dec_seq_embed = self.embedding(dec_seq).permute(1, 0, 2)
-            dec_seq_embed = self.positional_encoding(dec_seq_embed)
-            tgt_mask = self.generate_square_subsequent_mask(
-                dec_seq_embed.shape[0])
-            output = self.decoder(
-                dec_seq_embed,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_mask=None,
-                tgt_key_padding_mask=None,
-                memory_key_padding_mask=None)
-            dec_output = output.permute(1, 0, 2)
-            dec_output = dec_output[:, -1, :]
-            tgt_word_prj = self.tgt_word_prj(dec_output)
-            word_prob = F.softmax(tgt_word_prj, dim=1)
-            preds_idx = word_prob.argmax(dim=1)
-            if torch.equal(
-                    preds_idx,
-                    torch.full(
-                        preds_idx.shape, 3, dtype=torch.int64)):
-                break
-            preds_prob = torch.max(word_prob, dim=1).values
-            dec_seq = torch.cat(
-                [dec_seq, torch.reshape(preds_idx, (-1, 1))], dim=1)
-            dec_prob = torch.cat(
-                [dec_prob, torch.reshape(preds_prob, (-1, 1))], dim=1)
-        return [dec_seq, dec_prob]
-
-    def forward_beam(self, images):
-        ''' Translation work in one batch '''
-
-        def get_inst_idx_to_tensor_position_map(inst_idx_list):
-            ''' Indicate the position of an instance in a tensor. '''
-            return {
-                inst_idx: tensor_position
-                for tensor_position, inst_idx in enumerate(inst_idx_list)
-            }
-
-        def collect_active_part(beamed_tensor, curr_active_inst_idx,
-                                n_prev_active_inst, n_bm):
-            ''' Collect tensor parts associated to active instances. '''
-
-            beamed_tensor_shape = beamed_tensor.shape
-            n_curr_active_inst = len(curr_active_inst_idx)
-            new_shape = (n_curr_active_inst * n_bm, beamed_tensor_shape[1],
-                         beamed_tensor_shape[2])
-
-            beamed_tensor = beamed_tensor.reshape([n_prev_active_inst, -1])
-            beamed_tensor = beamed_tensor.index_select(
-                curr_active_inst_idx, axis=0)
-            beamed_tensor = beamed_tensor.reshape(new_shape)
-
-            return beamed_tensor
-
-        def collate_active_info(src_enc, inst_idx_to_position_map,
-                                active_inst_idx_list):
-            # Sentences which are still active are collected,
-            # so the decoder will not run on completed sentences.
-
-            n_prev_active_inst = len(inst_idx_to_position_map)
-            active_inst_idx = [
-                inst_idx_to_position_map[k] for k in active_inst_idx_list
-            ]
-            active_inst_idx = torch.tensor(active_inst_idx, dtype=torch.int64)
-            active_src_enc = collect_active_part(
-                src_enc.permute(1, 0, 2), active_inst_idx,
-                n_prev_active_inst, n_bm).permute(1, 0, 2)
-            active_inst_idx_to_position_map = get_inst_idx_to_tensor_position_map(
-                active_inst_idx_list)
-            return active_src_enc, active_inst_idx_to_position_map
-
-        def beam_decode_step(inst_dec_beams, len_dec_seq, enc_output,
-                             inst_idx_to_position_map, n_bm,
-                             memory_key_padding_mask):
-            ''' Decode and update beam status, and then return active beam idx '''
-
-            def prepare_beam_dec_seq(inst_dec_beams, len_dec_seq):
-                dec_partial_seq = [
-                    b.get_current_state() for b in inst_dec_beams if not b.done
-                ]
-                dec_partial_seq = torch.stack(dec_partial_seq)
-                dec_partial_seq = dec_partial_seq.reshape([-1, len_dec_seq])
-                return dec_partial_seq
-
-            def predict_word(dec_seq, enc_output, n_active_inst, n_bm,
-                             memory_key_padding_mask):
-                dec_seq = self.embedding(dec_seq).permute(1, 0, 2)
-                dec_seq = self.positional_encoding(dec_seq)
-                tgt_mask = self.generate_square_subsequent_mask(
-                    dec_seq.shape[0])
-                dec_output = self.decoder(
-                    dec_seq,
-                    enc_output,
-                    tgt_mask=tgt_mask,
-                    tgt_key_padding_mask=None,
-                    memory_key_padding_mask=memory_key_padding_mask, )
-                dec_output = dec_output.permute(1, 0, 2)
-                dec_output = dec_output[:,
-                                        -1, :]  # Pick the last step: (bh * bm) * d_h
-                word_prob = F.softmax(self.tgt_word_prj(dec_output), dim=1)
-                word_prob = torch.reshape(word_prob, (n_active_inst, n_bm, -1))
-                return word_prob
-
-            def collect_active_inst_idx_list(inst_beams, word_prob,
-                                             inst_idx_to_position_map):
-                active_inst_idx_list = []
-                for inst_idx, inst_position in inst_idx_to_position_map.items():
-                    is_inst_complete = inst_beams[inst_idx].advance(word_prob[
-                        inst_position])
-                    if not is_inst_complete:
-                        active_inst_idx_list += [inst_idx]
-
-                return active_inst_idx_list
-
-            n_active_inst = len(inst_idx_to_position_map)
-            dec_seq = prepare_beam_dec_seq(inst_dec_beams, len_dec_seq)
-            word_prob = predict_word(dec_seq, enc_output, n_active_inst, n_bm,
-                                     None)
-            # Update the beam with predicted word prob information and collect incomplete instances
-            active_inst_idx_list = collect_active_inst_idx_list(
-                inst_dec_beams, word_prob, inst_idx_to_position_map)
-            return active_inst_idx_list
-
-        def collect_hypothesis_and_scores(inst_dec_beams, n_best):
-            all_hyp, all_scores = [], []
-            for inst_idx in range(len(inst_dec_beams)):
-                scores, tail_idxs = inst_dec_beams[inst_idx].sort_scores()
-                all_scores += [scores[:n_best]]
-                hyps = [
-                    inst_dec_beams[inst_idx].get_hypothesis(i)
-                    for i in tail_idxs[:n_best]
-                ]
-                all_hyp += [hyps]
-            return all_hyp, all_scores
-
-        with torch.no_grad():
-            #-- Encode
-            if self.encoder is not None:
-                src = self.positional_encoding(images.permute(1, 0, 2))
-                src_enc = self.encoder(src)
-            else:
-                src_enc = images.squeeze(2).transpose([0, 2, 1])
-
-            n_bm = self.beam_size
-            src_shape = src_enc.shape
-            inst_dec_beams = [Beam(n_bm) for _ in range(1)]
-            active_inst_idx_list = list(range(1))
-            # Repeat data for beam search
-            # src_enc = paddle.tile(src_enc, [1, n_bm, 1])
-            src_enc = src_enc.repeat(1, n_bm, 1)
-            inst_idx_to_position_map = get_inst_idx_to_tensor_position_map(
-                active_inst_idx_list)
-            # Decode
-            for len_dec_seq in range(1, 25):
-                src_enc_copy = src_enc.clone()
-                active_inst_idx_list = beam_decode_step(
-                    inst_dec_beams, len_dec_seq, src_enc_copy,
-                    inst_idx_to_position_map, n_bm, None)
-                if not active_inst_idx_list:
-                    break  # all instances have finished their path to <EOS>
-                src_enc, inst_idx_to_position_map = collate_active_info(
-                    src_enc_copy, inst_idx_to_position_map,
-                    active_inst_idx_list)
-        batch_hyp, batch_scores = collect_hypothesis_and_scores(inst_dec_beams,
-                                                                1)
-        result_hyp = []
-        hyp_scores = []
-        for bs_hyp, score in zip(batch_hyp, batch_scores):
-            l = len(bs_hyp[0])
-            bs_hyp_pad = bs_hyp[0] + [3] * (25 - l)
-            result_hyp.append(bs_hyp_pad)
-            score = float(score) / l
-            hyp_score = [score for _ in range(25)]
-            hyp_scores.append(hyp_score)
-        return [
-            torch.tensor(
-                np.array(result_hyp), dtype=torch.int64),
-            torch.tensor(hyp_scores)
-        ]
-
-    def generate_square_subsequent_mask(self, sz):
-        """Generate a square mask for the sequence. The masked positions are filled with float('-inf').
-            Unmasked positions are filled with float(0.0).
-        """
-        mask = torch.zeros([sz, sz], dtype=torch.float32)
-        mask_inf = torch.triu(
-            torch.full(
-                size=[sz, sz], fill_value=float('-Inf'),  dtype=torch.float32),
-            diagonal=1)
-        mask = mask + mask_inf
-        return mask
-
-    def generate_padding_mask(self, x):
-        # padding_mask = paddle.equal(x, paddle.to_tensor(0, dtype=x.dtype))
-        padding_mask = (x == torch.tensor(0, dtype=x.dtype))
-        return padding_mask
-
-    def _reset_parameters(self):
-        """Initiate parameters in the transformer model."""
-
-        for p in self.parameters():
-            if p.dim() > 1:
-                xavier_uniform_(p)
+    def forward(self, x: Tensor) -> Tensor:
+        emb = self.embedding(x)
+        return emb * self.scale_factor
 
 
-class TransformerEncoder(nn.Module):
-    """TransformerEncoder is a stack of N encoder layers
-    Args:
-        encoder_layer: an instance of the TransformerEncoderLayer() class (required).
-        num_layers: the number of sub-encoder-layers in the encoder (required).
-        norm: the layer normalization component (optional).
+class PositionalEncoding(nn.Module):  # 重命名以匹配 Paddle 中的类名
+    """NRTR 位置编码层。对应 Paddle 的 PositionalEncoding 类。
+    Paddle 的实现期望输入是 (S, N, E)，输出也是 (S, N, E)。
+    PyTorch Transformer 层如果 batch_first=False，也是 (S, N, E)。
+    如果 batch_first=True，则是 (N, S, E)。这里我们按照 Paddle 的原始 S,N,E 格式。
     """
 
-    def __init__(self, encoder_layer, num_layers):
-        super(TransformerEncoder, self).__init__()
-        self.layers = _get_clones(encoder_layer, num_layers)
-        self.num_layers = num_layers
+    def __init__(self, dropout: float, dim: int, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, src):
-        """Pass the input through the endocder layers in turn.
-        Args:
-            src: the sequnce to the encoder (required).
-            mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-        """
-        output = src
+        pe = torch.zeros(max_len, dim)  # (S, E)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (S, 1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+        )  # (E/2)
 
-        for i in range(self.num_layers):
-            output = self.layers[i](output,
-                                    src_mask=None,
-                                    src_key_padding_mask=None)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if dim % 2 != 0:
+            pe[:, 1::2] = torch.cos(position * div_term)[:, : dim // 2]
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
 
+        # Paddle: pe = paddle.unsqueeze(pe, 0) -> (1, max_len, dim)
+        #         pe = paddle.transpose(pe, [1, 0, 2]) -> (max_len, 1, dim)
+        pe = pe.unsqueeze(1)  # (max_len, 1, dim) 以便广播到 (max_len, N, dim)
+        self.register_buffer("pe", pe)  # (max_len, 1, dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x 形状: (S, N, E) - 对应 Paddle 的输入格式
+        # self.pe 形状: (max_len, 1, E)
+        x = x + self.pe[: x.size(0), :]  # x.size(0) is S (sequence length)
+        return self.dropout(x)
+
+
+class MultiheadAttention(nn.Module):  # 重命名以匹配 Paddle 中的类名
+    """NRTR 多头注意力机制。对应 Paddle 的 MultiheadAttention 类。
+    输入 query, key, value 期望形状 (N, S, E) (batch_first=True 风格)。
+    但 Paddle 的 TransformerBlock.forward 传递给它的是 (S, N, E) 转置后的。
+    这里我们假设输入是 (S, N, E)，并进行相应调整。
+    或者，我们让输入是 (N, S, E)，并在内部处理转置，或者让调用者处理。
+    Paddle 的 `MultiheadAttention` forward 接收的 query shape 是 `(N, qN, C)`
+    经过 reshape 和 transpose 后变成 `(N, num_heads, qN, head_dim)`
+    这里我们直接采用 `batch_first=True` 的 PyTorch 风格 `(N, S, E)` 作为输入。
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        self_attn: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, (
+            "embed_dim 必须能被 num_heads 整除"
+        )
+        self.scale = self.head_dim**-0.5
+        self.self_attn = self_attn
+
+        # Paddle 的 Linear 层在其定义中未指定 bias_attr 时，是有偏置的。
+        if self_attn:
+            self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3)  # Paddle: self.qkv
+        else:
+            self.q_proj = nn.Linear(embed_dim, embed_dim)
+            self.kv_proj = nn.Linear(embed_dim, embed_dim * 2)  # Paddle: self.kv
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)  # Paddle: self.out_proj
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # 假设输入是 (N, S, E) (batch_first=True)
+        N, S_q, E = query.shape
+
+        if self.self_attn:
+            if key is not None or value is not None:
+                raise ValueError("自注意力模式下，key 和 value 应该为 None。")
+            # (N, S_q, 3*E) -> (N, S_q, 3, num_heads, head_dim) -> (3, N, num_heads, S_q, head_dim)
+            qkv = (
+                self.qkv_proj(query)
+                .reshape(N, S_q, 3, self.num_heads, self.head_dim)
+                .permute(2, 0, 3, 1, 4)
+            )
+            q, k, v = qkv[0], qkv[1], qkv[2]  # 各自是 (N, num_heads, S_q, head_dim)
+        else:
+            if (
+                key is None or value is None
+            ):  # 在交叉注意力中，key 和 value (通常来自 memory) 是必需的
+                # Paddle 的实现中，当 self_attn=False 时，是交叉注意力，key=memory
+                # 如果是解码器自注意力，但 with_cross_attn=False 的情况，则 key=query, value=query
+                # 这里我们严格按照 Paddle MultiheadAttention 的用法：self_attn=False 时 key 不会是 None
+                raise ValueError("交叉注意力模式下，key 和 value 不能为空。")
+
+            S_k = key.shape[1]
+
+            q = (
+                self.q_proj(query)
+                .reshape(N, S_q, self.num_heads, self.head_dim)
+                .permute(0, 2, 1, 3)
+            )  # (N, num_h, S_q, head_d)
+
+            # Paddle: self.kv = nn.Linear(embed_dim, embed_dim * 2)
+            # kv = self.kv(key).reshape((0, kN, 2, num_heads, head_dim)).transpose((2, 0, 3, 1, 4))
+            # k, v = kv[0], kv[1]
+            # 这意味着 key 和 value 是从同一个输入 `key`（即 memory）经过同一个 `kv_proj` 得到的
+            kv_projected_from_key = self.kv_proj(key)  # (N, S_k, 2*E)
+            kv_split = kv_projected_from_key.reshape(
+                N, S_k, 2, self.num_heads, self.head_dim
+            ).permute(2, 0, 3, 1, 4)
+            k, v = kv_split[0], kv_split[1]  # (N, num_h, S_k, head_d)
+
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+
+        if attn_mask is not None:
+            # attn_mask (S_q, S_k) for causal or (N, S_k) for padding, needs broadcasting
+            # PyTorch nn.MultiheadAttention expects attn_mask where True means "don't attend"
+            # Paddle adds -inf. So, if attn_mask is float (-inf for masked), direct add is fine.
+            # If attn_mask is (S_q, S_k), it should be broadcastable to (N, num_heads, S_q, S_k)
+            # Or if (N, S_k), expand to (N, 1, 1, S_k) for padding mask
+            attn_scores = attn_scores + attn_mask
+
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_drop(attn_probs)
+
+        context = (attn_probs @ v).transpose(1, 2).reshape(N, S_q, self.embed_dim)
+        output = self.out_proj(context)
         return output
 
 
-class TransformerDecoder(nn.Module):
-    """TransformerDecoder is a stack of N decoder layers
+class TransformerBlock(nn.Module):  # 重命名以匹配 Paddle 中的类名
+    """NRTR Transformer 块的 PyTorch 实现。对应 Paddle 的 TransformerBlock 类。"""
 
-    Args:
-        decoder_layer: an instance of the TransformerDecoderLayer() class (required).
-        num_layers: the number of sub-decoder-layers in the decoder (required).
-        norm: the layer normalization component (optional).
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        attention_dropout_rate: float = 0.0,
+        residual_dropout_rate: float = 0.1,
+        with_self_attn: bool = True,
+        with_cross_attn: bool = False,
+        epsilon: float = 1e-5,
+    ):
+        super().__init__()
+        self.with_self_attn = with_self_attn
+        if with_self_attn:
+            self.self_attn = (
+                MultiheadAttention(  # 使用上面定义的 PyTorch 版 MultiheadAttention
+                    d_model, nhead, dropout=attention_dropout_rate, self_attn=True
+                )
+            )
+            self.norm1 = nn.LayerNorm(d_model, eps=epsilon)
+            self.dropout1 = nn.Dropout(residual_dropout_rate)
 
-    """
+        self.with_cross_attn = with_cross_attn
+        if with_cross_attn:
+            self.cross_attn = (
+                MultiheadAttention(  # 使用上面定义的 PyTorch 版 MultiheadAttention
+                    d_model,
+                    nhead,
+                    dropout=attention_dropout_rate,
+                    self_attn=False,  # self_attn=False for cross-attn
+                )
+            )
+            self.norm2 = nn.LayerNorm(d_model, eps=epsilon)
+            self.dropout2 = nn.Dropout(residual_dropout_rate)
 
-    def __init__(self, decoder_layer, num_layers):
-        super(TransformerDecoder, self).__init__()
-        self.layers = _get_clones(decoder_layer, num_layers)
-        self.num_layers = num_layers
+        self.mlp = Mlp(
+            in_features=d_model,
+            hidden_features=dim_feedforward,
+            act_layer=nn.ReLU,
+            drop=residual_dropout_rate,  # Paddle 用 ReLU
+        )
+        self.norm3 = nn.LayerNorm(d_model, eps=epsilon)
+        self.dropout3 = nn.Dropout(residual_dropout_rate)
 
-    def forward(self,
-                tgt,
-                memory,
-                tgt_mask=None,
-                memory_mask=None,
-                tgt_key_padding_mask=None,
-                memory_key_padding_mask=None):
-        """Pass the inputs (and mask) through the decoder layer in turn.
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Optional[Tensor] = None,
+        self_attn_mask: Optional[Tensor] = None,  # 用于自注意力的掩码
+        cross_attn_mask: Optional[
+            Tensor
+        ] = None,  # 用于交叉注意力的掩码 (通常是 memory_padding_mask)
+    ) -> Tensor:
+        # 输入 tgt, memory 期望形状 (N, S, E) (batch_first=True)
+        # Paddle 的 TransformerBlock.forward 接收的 tgt 和 memory 都是 (N,S,C)
+        # 然后在 MultiheadAttention 内部或者之前进行转置
+        # 我们的 MultiheadAttention_PT 假设输入是 (N,S,E)
 
-        Args:
-            tgt: the sequence to the decoder (required).
-            memory: the sequnce from the last layer of the encoder (required).
-            tgt_mask: the mask for the tgt sequence (optional).
-            memory_mask: the mask for the memory sequence (optional).
-            tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
-            memory_key_padding_mask: the mask for the memory keys per batch (optional).
-        """
-        output = tgt
-        for i in range(self.num_layers):
-            output = self.layers[i](
-                output,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask)
+        if self.with_self_attn:
+            sa_out = self.self_attn(tgt, attn_mask=self_attn_mask)
+            tgt = self.norm1(tgt + self.dropout1(sa_out))
 
-        return output
+        if self.with_cross_attn:
+            if memory is None:
+                raise ValueError("交叉注意力需要 memory 输入。")
+            # cross_attn(query, key, value, attn_mask)
+            # query=tgt, key=memory, value=memory
+            ca_out = self.cross_attn(
+                tgt, key=memory, value=memory, attn_mask=cross_attn_mask
+            )
+            tgt = self.norm2(tgt + self.dropout2(ca_out))
 
-
-class TransformerEncoderLayer(nn.Module):
-    """TransformerEncoderLayer is made up of self-attn and feedforward network.
-    This standard encoder layer is based on the paper "Attention Is All You Need".
-    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
-    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
-    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
-    in a different way during application.
-
-    Args:
-        d_model: the number of expected features in the input (required).
-        nhead: the number of heads in the multiheadattention models (required).
-        dim_feedforward: the dimension of the feedforward network model (default=2048).
-        dropout: the dropout value (default=0.1).
-
-    """
-
-    def __init__(self,
-                 d_model,
-                 nhead,
-                 dim_feedforward=2048,
-                 attention_dropout_rate=0.0,
-                 residual_dropout_rate=0.1):
-        super(TransformerEncoderLayer, self).__init__()
-        self.self_attn = MultiheadAttention(
-            d_model, nhead, dropout=attention_dropout_rate)
-
-        self.conv1 = nn.Conv2d(
-            in_channels=d_model,
-            out_channels=dim_feedforward,
-            kernel_size=(1, 1))
-        self.conv2 = nn.Conv2d(
-            in_channels=dim_feedforward,
-            out_channels=d_model,
-            kernel_size=(1, 1))
-
-        self.norm1 = LayerNorm(d_model)
-        self.norm2 = LayerNorm(d_model)
-        self.dropout1 = Dropout(residual_dropout_rate)
-        self.dropout2 = Dropout(residual_dropout_rate)
-
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        """Pass the input through the endocder layer.
-        Args:
-            src: the sequnce to the encoder layer (required).
-            src_mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-        """
-        src2 = self.self_attn(
-            src,
-            src,
-            src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask)
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-
-        src = src.permute(1, 2, 0)
-        src = torch.unsqueeze(src, 2)
-        src2 = self.conv2(F.relu(self.conv1(src)))
-        src2 = torch.squeeze(src2, 2)
-        src2 = src2.permute(2, 0, 1)
-        src = torch.squeeze(src, 2)
-        src = src.permute(2, 0, 1)
-
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-        return src
-
-
-class TransformerDecoderLayer(nn.Module):
-    """TransformerDecoderLayer is made up of self-attn, multi-head-attn and feedforward network.
-    This standard decoder layer is based on the paper "Attention Is All You Need".
-    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
-    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
-    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
-    in a different way during application.
-
-    Args:
-        d_model: the number of expected features in the input (required).
-        nhead: the number of heads in the multiheadattention models (required).
-        dim_feedforward: the dimension of the feedforward network model (default=2048).
-        dropout: the dropout value (default=0.1).
-
-    """
-
-    def __init__(self,
-                 d_model,
-                 nhead,
-                 dim_feedforward=2048,
-                 attention_dropout_rate=0.0,
-                 residual_dropout_rate=0.1):
-        super(TransformerDecoderLayer, self).__init__()
-        self.self_attn = MultiheadAttention(
-            d_model, nhead, dropout=attention_dropout_rate)
-        self.multihead_attn = MultiheadAttention(
-            d_model, nhead, dropout=attention_dropout_rate)
-
-        self.conv1 = nn.Conv2d(
-            in_channels=d_model,
-            out_channels=dim_feedforward,
-            kernel_size=(1, 1))
-        self.conv2 = nn.Conv2d(
-            in_channels=dim_feedforward,
-            out_channels=d_model,
-            kernel_size=(1, 1))
-
-        self.norm1 = LayerNorm(d_model)
-        self.norm2 = LayerNorm(d_model)
-        self.norm3 = LayerNorm(d_model)
-        self.dropout1 = Dropout(residual_dropout_rate)
-        self.dropout2 = Dropout(residual_dropout_rate)
-        self.dropout3 = Dropout(residual_dropout_rate)
-
-    def forward(self,
-                tgt,
-                memory,
-                tgt_mask=None,
-                memory_mask=None,
-                tgt_key_padding_mask=None,
-                memory_key_padding_mask=None):
-        """Pass the inputs (and mask) through the decoder layer.
-
-        Args:
-            tgt: the sequence to the decoder layer (required).
-            memory: the sequnce from the last layer of the encoder (required).
-            tgt_mask: the mask for the tgt sequence (optional).
-            memory_mask: the mask for the memory sequence (optional).
-            tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
-            memory_key_padding_mask: the mask for the memory keys per batch (optional).
-
-        """
-        tgt2 = self.self_attn(
-            tgt,
-            tgt,
-            tgt,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-        tgt2 = self.multihead_attn(
-            tgt,
-            memory,
-            memory,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask)
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-
-        # default
-        tgt = tgt.permute(1, 2, 0)
-        tgt = torch.unsqueeze(tgt, 2)
-        tgt2 = self.conv2(F.relu(self.conv1(tgt)))
-        tgt2 = torch.squeeze(tgt2, 2)
-        tgt2 = tgt2.permute(2, 0, 1)
-        tgt = torch.squeeze(tgt, 2)
-        tgt = tgt.permute(2, 0, 1)
-
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
+        mlp_out = self.mlp(tgt)
+        tgt = self.norm3(tgt + self.dropout3(mlp_out))
         return tgt
 
 
-def _get_clones(module, N):
-    return LayerList([copy.deepcopy(module) for i in range(N)])
+class Transformer(nn.Module):  # 主 Transformer 类，与 Paddle 文件中的类名一致
+    """NRTR Transformer 模型的 PyTorch 实现。"""
 
+    def __init__(
+        self,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_encoder_layers: int = 6,
+        beam_size: int = 0,
+        num_decoder_layers: int = 6,
+        max_len: int = 25,
+        dim_feedforward: int = 1024,
+        attention_dropout_rate: float = 0.0,
+        residual_dropout_rate: float = 0.1,
+        in_channels: int = 0,  # 此参数在 Paddle Transformer 中存在但未使用，因为特征已转换
+        out_channels: int = 0,  # 纯字符类别数
+        scale_embedding: bool = True,
+    ):
+        super().__init__()
+        # Paddle: self.out_channels = out_channels + 1
+        # 这个 self.out_channels 用于 Embedding 的词表大小和 tgt_word_prj 的输出维度
+        self.decoder_vocab_size = out_channels + 1
 
-class PositionalEncoding(nn.Module):
-    """Inject some information about the relative or absolute position of the tokens
-        in the sequence. The positional encodings have the same dimension as
-        the embeddings, so that the two can be summed. Here, we use sine and cosine
-        functions of different frequencies.
-    .. math::
-        \text{PosEncoder}(pos, 2i) = sin(pos/10000^(2i/d_model))
-        \text{PosEncoder}(pos, 2i+1) = cos(pos/10000^(2i/d_model))
-        \text{where pos is the word position and i is the embed idx)
-    Args:
-        d_model: the embed dim (required).
-        dropout: the dropout value (default=0.1).
-        max_len: the max. length of the incoming sequence (default=5000).
-    Examples:
-        >>> pos_encoder = PositionalEncoding(d_model)
-    """
-
-    def __init__(self, dropout, dim, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros([max_len, dim])
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, dim, 2).type(torch.float32) *
-            (-math.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = torch.unsqueeze(pe, 0)
-        pe = pe.permute(1, 0, 2)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        """Inputs of forward function
-        Args:
-            x: the sequence fed to the positional encoder model (required).
-        Shape:
-            x: [sequence length, batch size, embed dim]
-            output: [sequence length, batch size, embed dim]
-        Examples:
-            >>> output = pos_encoder(x)
-        """
-        x = x + self.pe[:x.shape[0], :]
-        return self.dropout(x)
-
-
-class PositionalEncoding_2d(nn.Module):
-    """Inject some information about the relative or absolute position of the tokens
-        in the sequence. The positional encodings have the same dimension as
-        the embeddings, so that the two can be summed. Here, we use sine and cosine
-        functions of different frequencies.
-    .. math::
-        \text{PosEncoder}(pos, 2i) = sin(pos/10000^(2i/d_model))
-        \text{PosEncoder}(pos, 2i+1) = cos(pos/10000^(2i/d_model))
-        \text{where pos is the word position and i is the embed idx)
-    Args:
-        d_model: the embed dim (required).
-        dropout: the dropout value (default=0.1).
-        max_len: the max. length of the incoming sequence (default=5000).
-    Examples:
-        >>> pos_encoder = PositionalEncoding(d_model)
-    """
-
-    def __init__(self, dropout, dim, max_len=5000):
-        super(PositionalEncoding_2d, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros([max_len, dim])
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, dim, 2).type(torch.float32) *
-            (-math.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = torch.unsqueeze(pe, 0).permute(1, 0, 2)
-        self.register_buffer('pe', pe)
-
-        self.avg_pool_1 = nn.AdaptiveAvgPool2d((1, 1))
-        self.linear1 = nn.Linear(dim, dim)
-        self.linear1.weight.data.fill_(1.)
-        self.avg_pool_2 = nn.AdaptiveAvgPool2d((1, 1))
-        self.linear2 = nn.Linear(dim, dim)
-        self.linear2.weight.data.fill_(1.)
-
-    def forward(self, x):
-        """Inputs of forward function
-        Args:
-            x: the sequence fed to the positional encoder model (required).
-        Shape:
-            x: [sequence length, batch size, embed dim]
-            output: [sequence length, batch size, embed dim]
-        Examples:
-            >>> output = pos_encoder(x)
-        """
-        w_pe = self.pe[:x.shape[-1], :]
-        w1 = self.linear1(self.avg_pool_1(x).squeeze()).unsqueeze(0)
-        w_pe = w_pe * w1
-        w_pe = w_pe.permute(1, 2, 0)
-        w_pe = torch.unsqueeze(w_pe, 2)
-
-        h_pe = self.pe[:x.shape[-2], :]
-        w2 = self.linear2(self.avg_pool_2(x).squeeze()).unsqueeze(0)
-        h_pe = h_pe * w2
-        h_pe = h_pe.permute(1, 2, 0)
-        h_pe = torch.unsqueeze(h_pe, 3)
-
-        x = x + w_pe + h_pe
-        x = torch.reshape(
-            x, [x.shape[0], x.shape[1], x.shape[2] * x.shape[3]]
-        ).permute(2,0,1)
-
-        return self.dropout(x)
-
-
-class Embeddings(nn.Module):
-    def __init__(self, d_model, vocab, padding_idx, scale_embedding):
-        super(Embeddings, self).__init__()
-        self.embedding = nn.Embedding(vocab, d_model, padding_idx=padding_idx)
-        w0 = np.random.normal(0.0, d_model**-0.5,
-                              (vocab, d_model)).astype(np.float32)
-        self.embedding.weight.data = torch.from_numpy(w0)
+        self.max_len = max_len
         self.d_model = d_model
-        self.scale_embedding = scale_embedding
+        self.nhead = nhead
+        self.beam_size = beam_size  # 0 表示贪婪解码
 
-    def forward(self, x):
-        if self.scale_embedding:
-            x = self.embedding(x)
-            return x * math.sqrt(self.d_model)
-        return self.embedding(x)
+        self.embedding = Embeddings(  # 使用上面定义的 PyTorch 版 Embeddings
+            d_model=d_model,
+            vocab=self.decoder_vocab_size,
+            padding_idx=0,
+            scale_embedding=scale_embedding,  # 假设 PAD_IDX = 0
+        )
+        self.positional_encoding = (
+            PositionalEncoding(  # 使用上面定义的 PyTorch 版 PositionalEncoding
+                dropout=residual_dropout_rate,
+                dim=d_model,
+                max_len=max_len + 50,  # 增加 buffer for max_len
+            )
+        )
 
-
-class Beam():
-    ''' Beam search '''
-
-    def __init__(self, size, device=False):
-
-        self.size = size
-        self._done = False
-        # The score for each translation on the beam.
-        self.scores = torch.zeros((size, ), dtype=torch.float32)
-        self.all_scores = []
-        # The backpointers at each time-step.
-        self.prev_ks = []
-        # The outputs at each time-step.
-        self.next_ys = [torch.full((size, ), 0, dtype=torch.int64)]
-        self.next_ys[0][0] = 2
-
-    def get_current_state(self):
-        "Get the outputs for the current timestep."
-        return self.get_tentative_hypothesis()
-
-    def get_current_origin(self):
-        "Get the backpointers for the current timestep."
-        return self.prev_ks[-1]
-
-    @property
-    def done(self):
-        return self._done
-
-    def advance(self, word_prob):
-        "Update beam status and check if finished or not."
-        num_words = word_prob.shape[1]
-
-        # Sum the previous scores.
-        if len(self.prev_ks) > 0:
-            beam_lk = word_prob + self.scores.unsqueeze(1).expand_as(word_prob)
+        if num_encoder_layers > 0:
+            self.encoder = nn.ModuleList(  # Paddle: self.encoder
+                [
+                    TransformerBlock(
+                        d_model,
+                        nhead,
+                        dim_feedforward,
+                        attention_dropout_rate,
+                        residual_dropout_rate,
+                        with_self_attn=True,
+                        with_cross_attn=False,
+                    )
+                    for _ in range(num_encoder_layers)
+                ]
+            )
         else:
-            beam_lk = word_prob[0]
+            self.encoder = None  # 表示 src 直接作为 memory
 
-        flat_beam_lk = beam_lk.reshape([-1])
-        best_scores, best_scores_id = flat_beam_lk.topk(self.size, 0, True,
-                                                        True)  # 1st sort
-        self.all_scores.append(self.scores)
-        self.scores = best_scores
-        # bestScoresId is flattened as a (beam x word) array,
-        # so we need to calculate which word and beam each score came from
-        prev_k = best_scores_id // num_words
-        self.prev_ks.append(prev_k)
-        self.next_ys.append(best_scores_id - prev_k * num_words)
-        # End condition is when top-of-beam is EOS.
-        if self.next_ys[-1][0] == 3:
-            self._done = True
-            self.all_scores.append(self.scores)
+        self.decoder = nn.ModuleList(  # Paddle: self.decoder
+            [
+                TransformerBlock(
+                    d_model,
+                    nhead,
+                    dim_feedforward,
+                    attention_dropout_rate,
+                    residual_dropout_rate,
+                    with_self_attn=True,
+                    with_cross_attn=True,
+                )
+                for _ in range(num_decoder_layers)
+            ]
+        )
 
-        return self._done
+        self.tgt_word_prj = nn.Linear(
+            d_model, self.decoder_vocab_size, bias=False
+        )  # Paddle bias_attr=False
+        # Paddle 初始化: w0 = np.random.normal(0.0, d_model**-0.5, (d_model, self.out_channels)).astype(np.float32)
+        # self.tgt_word_prj.weight.set_value(w0)
+        # PyTorch Linear weight is (out_features, in_features)
+        # Paddle Linear weight is (in_features, out_features)
+        # 如果直接用 paddle 的 numpy weight，需要转置
+        nn.init.normal_(self.tgt_word_prj.weight, mean=0.0, std=d_model**-0.5)
 
-    def sort_scores(self):
-        "Sort the scores."
-        return self.scores, torch.tensor(
-            [i for i in range(int(self.scores.shape[0]))], dtype=torch.int32)
+        self.apply(self._init_weights_module_level)
 
-    def get_the_best_score_and_idx(self):
-        "Get the score of the best in the beam."
-        scores, ids = self.sort_scores()
-        return scores[1], ids[1]
+    def _init_weights_module_level(self, m: nn.Module):
+        """应用于整个模块的权重初始化。"""
+        if isinstance(m, nn.Linear):
+            # 避免重复初始化已经特定初始化的层（如 tgt_word_prj 和 Embedding 内的）
+            # 以及 Mlp 内部的 fc1, fc2 (它们可以用默认 Kaiming 或 Xavier)
+            if m is not self.tgt_word_prj and not hasattr(m, "_is_embedding_related"):
+                xavier_normal_(m.weight)  # Paddle 使用 XavierNormal
+                if m.bias is not None:
+                    zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            # Embeddings 类内部已经处理了初始化
+            pass
+        elif isinstance(m, nn.LayerNorm):
+            if hasattr(m, "weight") and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if hasattr(m, "bias") and m.bias is not None:
+                nn.init.zeros_(m.bias)
 
-    def get_tentative_hypothesis(self):
-        "Get the decoded sequence for the current timestep."
-        if len(self.next_ys) == 1:
-            dec_seq = self.next_ys[0].unsqueeze(1)
-        else:
-            _, keys = self.sort_scores()
-            hyps = [self.get_hypothesis(k) for k in keys]
-            hyps = [[2] + h for h in hyps]
-            dec_seq = torch.tensor(hyps, dtype=torch.int64)
-        return dec_seq
+    def _generate_square_subsequent_mask(self, sz: int, device: torch.device) -> Tensor:
+        """为序列生成一个上三角的注意力掩码 (causal mask)。
+        被掩码的位置为 -inf，未被掩码的为 0.0。
+        输出形状: (sz, sz)
+        Paddle 的 mask.unsqueeze([0,1]) 会变成 (1,1,sz,sz)
+        PyTorch nn.MultiheadAttention attn_mask: (L,S) or (N*num_heads, L,S) where L=tgt_len, S=src_len
+        对于 decoder自注意力 L=S=tgt_len, mask (tgt_len, tgt_len)
+        对于 decoder交叉注意力 L=tgt_len, S=src_len, mask (tgt_len, src_len)
+        我们自定义的 MultiheadAttention_PT 的 attn_mask 会直接加到 scores 上，所以 (L,S) 的形状是合适的。
+        """
+        mask = torch.triu(
+            torch.full((sz, sz), float("-inf"), device=device), diagonal=1
+        )
+        return mask
 
-    def get_hypothesis(self, k):
-        """ Walk back to construct the full hypothesis. """
-        hyp = []
-        for j in range(len(self.prev_ks) - 1, -1, -1):
-            hyp.append(self.next_ys[j + 1][k])
-            k = self.prev_ks[j][k]
-        return list(map(lambda x: x.item(), hyp[::-1]))
+    def forward_train(self, src: Tensor, tgt_tokens_input: Tensor) -> Tensor:
+        # src: (N, S_src, E_src) - 编码器输出或图像特征 (memory)
+        # tgt_tokens_input: (N, S_tgt_in) - 目标序列输入 (例如, [SOS, c1, c2, ..., cN])
+        # 假设输入都已经是 batch_first=True (N, S, E)
+
+        tgt_emb = self.embedding(tgt_tokens_input)  # (N, S_tgt_in, d_model)
+        tgt_pe = self.positional_encoding(tgt_emb)  # (N, S_tgt_in, d_model)
+
+        tgt_self_attn_mask = self._generate_square_subsequent_mask(
+            tgt_tokens_input.size(1), src.device
+        )
+
+        memory = src
+        if self.encoder is not None:
+            # Paddle: src = self.positional_encoding(src)
+            # 假设 src 已经是 (N,S,E) 格式
+            memory = self.positional_encoding(src)  # 直接对 (N,S,E) 的 src 加位置编码
+            for encoder_layer in self.encoder:
+                # TransformerBlock.forward(tgt, memory, self_attn_mask, cross_attn_mask)
+                # 编码器块只有自注意力
+                memory = encoder_layer(
+                    memory, self_attn_mask=None
+                )  # 编码器自注意力通常不需要 mask，除非有 padding
+
+        decoder_output = tgt_pe
+        for decoder_layer in self.decoder:
+            decoder_output = decoder_layer(
+                decoder_output,
+                memory,
+                self_attn_mask=tgt_self_attn_mask,
+                cross_attn_mask=None,
+            )
+
+        logits = self.tgt_word_prj(decoder_output)
+        return logits
+
+    def forward_test(self, src: Tensor) -> List[Tensor]:
+        """贪婪解码。"""
+        N, device = src.size(0), src.device
+
+        memory = src
+        if self.encoder is not None:
+            memory = self.positional_encoding(src)
+            for encoder_layer in self.encoder:
+                memory = encoder_layer(memory)
+
+        SOS_TOKEN_IDX = 2  # 与 Paddle 实现一致
+        EOS_TOKEN_IDX = 3
+
+        decoded_ids = torch.full((N, 1), SOS_TOKEN_IDX, dtype=torch.long, device=device)
+
+        for _ in range(self.max_len - 1):  # 最多生成 max_len-1 个 token (因为SOS已存在)
+            current_seq_len = decoded_ids.size(1)
+
+            tgt_emb = self.embedding(decoded_ids)
+            tgt_pe = self.positional_encoding(tgt_emb)
+
+            tgt_self_attn_mask = self._generate_square_subsequent_mask(
+                current_seq_len, device
+            )
+
+            decoder_output = tgt_pe
+            for decoder_layer in self.decoder:
+                decoder_output = decoder_layer(
+                    decoder_output, memory, self_attn_mask=tgt_self_attn_mask
+                )
+
+            last_step_logits = self.tgt_word_prj(decoder_output[:, -1, :])
+            next_token_ids = torch.argmax(last_step_logits, dim=-1, keepdim=True)
+
+            # 检查是否所有批次都生成了 EOS
+            # 如果是，并且我们想在 EOS 后停止（不包括 EOS 本身），则在此处 break
+            # Paddle 的逻辑似乎是：如果下一个预测是 EOS，就停止，最终结果不包含这个 EOS
+            # 但它的循环条件是 `range(1, paddle.to_tensor(self.max_len))`，且 EOS 检查在 concat 之前
+            # 这里为了简单，我们先 concat，如果需要，可以在后处理移除 EOS 之后的内容
+            all_eos = (next_token_ids == EOS_TOKEN_IDX).all()
+            decoded_ids = torch.cat([decoded_ids, next_token_ids], dim=1)
+            if all_eos:
+                break
+            if decoded_ids.size(1) >= self.max_len:  # 达到最大长度 (包含SOS)
+                break
+
+        # Paddle forward_test 返回 [dec_seq, dec_prob]
+        # PyTorch MultiHead 的期望是字典，例如 {"predict": dec_seq, "predict_probs": dec_prob}
+        # 我们只返回序列，概率的精确跟踪对于贪婪解码不是必需的，除非 Beam Search
+        dummy_probs = torch.zeros_like(
+            decoded_ids, dtype=torch.float, device=device
+        )  # 占位符概率
+        return [decoded_ids, dummy_probs]
+
+    def forward_beam(self, src: Tensor) -> List[Tensor]:
+        """Beam Search (占位符)。"""
+        print(
+            "警告: Beam search 未在 PyTorch Transformer (NRTR) 中完全实现，将回退到贪婪解码。"
+        )
+        return self.forward_test(src)
+
+    def forward(
+        self, src: Tensor, targets: Optional[List[Tensor]] = None
+    ) -> Dict[str, Tensor]:
+        # src: (N, S_src, E_src) - 来自 before_gtc 的特征 (batch_first=True)
+        # targets: 训练时为 [tgt_tokens_for_input (N, S_tgt_in), tgt_lengths (N,)] (Paddle 风格)
+        #          或者简单地 [tgt_tokens_for_input_and_loss (N, S_full)]
+        #          推理时为 None
+
+        if self.training:
+            if targets is None or len(targets) < 1 or targets[0] is None:
+                raise ValueError("训练模式下，targets[0] (目标 token 序列) 不能为空。")
+
+            # Paddle 实现:
+            # max_len_dynamic = targets[1].max() # targets[1] 是不含SOS/EOS的长度
+            # tgt_padded_to_max_with_sos_eos = targets[0][:, : 2 + max_len_dynamic]
+            # decoder_input_tokens = tgt_padded_to_max_with_sos_eos[:, :-1] # [SOS, c1, ..., cN]
+            # 我们假设 PyTorch 的 targets[0] 已经是解码器输入形式: [SOS, c1, ..., cN]
+            decoder_input_tokens = targets[0]
+
+            logits = self.forward_train(src, decoder_input_tokens)
+            # logits 用于与 targets[0] 右移一位并加上 EOS 的序列计算损失
+            return {"predict": logits}
+        else:  # 推理模式
+            if self.beam_size > 0:
+                # 需要完整的 Beam 类和解码逻辑
+                pred_output = self.forward_beam(src)
+            else:
+                pred_output = self.forward_test(
+                    src
+                )  # 返回 [decoded_ids, decoded_probs]
+
+            return {"predict": pred_output[0], "predict_probs": pred_output[1]}
